@@ -40,8 +40,8 @@ docker compose up --build
 | <http://localhost:8000/health> | 健康检查，返回 `{"status":"ok"}` |
 | <http://localhost:8000/openapi.json> | OpenAPI 描述 |
 
-首次启动会自动在卷内安装环境就绪后的建表全部完成（`app.main` lifespan 中执行幂等 DDL）；
-数据库存放在命名卷 `mailarchive-data` 中，容器重建数据不丢。
+首次启动会自动在卷内完成数据库结构迁移（`app.main` lifespan 中执行显式版本迁移，
+见[持久化](#持久化)）；数据库存放在命名卷 `mailarchive-data` 中，容器重建数据不丢。
 
 ## 必要配置
 
@@ -49,7 +49,7 @@ docker compose up --build
 
 | 变量 | 默认值（本地）/ Compose 值 | 说明 |
 | --- | --- | --- |
-| `DATABASE_PATH` | `data/mailarchive.db` / `/data/mailarchive.db` | SQLite 数据库文件路径，父目录不存在会自动创建，表自动建立 |
+| `DATABASE_PATH` | `data/mailarchive.db` / `/data/mailarchive.db` | SQLite 数据库文件路径，父目录不存在会自动创建，结构在启动时按版本迁移自动建立 |
 
 端口通过 Compose 的 `8000:8000` 映射发布；如需换宿主机端口，例如改成本地 9000：
 
@@ -872,9 +872,46 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 冻结 / 清理下的归并一致性；幂等登记与批次归档、补链、人工纠偏、保留期实际
 清理的全部父指针变更与删除均在**单个事务**内提交。
 
-服务启动的建表 DDL 幂等；早期数据库（`messages` 无 `retain_until` 列、含旧版
-冻结成员快照表 `retention_freeze_members`）会在启动时自动补列、并删除已废弃的
-快照表（冻结锚点保留，保护范围自升级起随当前会话拓扑实时计算），无需手工迁移。
+### 结构版本与启动迁移
+
+数据库结构版本记录在 SQLite 的 `PRAGMA user_version` 中，启动时由
+`app.database.init_db()` 按**显式版本迁移**初始化：
+
+| 版本 | 迁移内容（均幂等，可安全重放） |
+| --- | --- |
+| 1 | 创建全部基础表（`batches` / `messages` / `batch_duplicates` / `batch_missing_refs` / `batch_cycles` / `idempotency_keys` / `batch_results` / `retention_freezes`）与 `messages(batch_id)` / `(parent_id)` / `(sent_at)` 索引 |
+| 2 | `messages` 补 `retain_until` 列，并建 `idx_messages_retain` 索引 |
+| 3 | 活跃冻结取代成员快照：删除废弃的 `retention_freeze_members` 表（冻结锚点 `retention_freezes` 保留） |
+
+- **空库**（无版本信息，`user_version = 0`）：在单个写事务内依次执行全部迁移，
+  直接到最新版；
+- **旧库**：从当前版本的下一个版本起**逐级升级**，每个迁移完成后推进
+  `user_version`，既有数据原样保留；早于版本化机制的库（`messages` 无
+  `retain_until` 列、含旧版冻结成员快照表 `retention_freeze_members`）也会
+  自动补列、删除废弃快照表（冻结锚点保留，保护范围自升级起随当前会话拓扑
+  实时计算），无需手工迁移；
+- 全部待执行迁移与版本号更新在**单个写事务**（`BEGIN IMMEDIATE`）内提交，
+  任一迁移失败整体回滚，不会留下“半升级”的库；重复启动是幂等的——
+  已在最新版时启动为无操作；
+- **拒绝降级启动**：若数据库版本**高于**当前程序支持的最高版本（即数据库曾由
+  更新版本的程序打开过），服务**拒绝启动**并输出明确错误
+  （`database schema version is N, but this program only supports up to
+  version M`），且不做任何写入；请升级程序，或按下节提示恢复旧版备份。
+- 现有表结构与各 API 行为在迁移前后保持不变。
+
+### 备份与恢复建议
+
+迁移只做“加法”与废弃表清理，但**升级前仍建议先备份数据库文件**
+（WAL 模式下有 `mailarchive.db`、`mailarchive.db-wal`、`mailarchive.db-shm`
+三个文件）：
+
+- **推荐（在线一致性快照）**：容器运行时用 SQLite 备份 API，
+  `sqlite3 /data/mailarchive.db ".backup '/backup/mailarchive-$(date +%F).db'"`，
+  可得到不依赖 WAL 的单文件一致备份；
+- 也可先停容器，再把卷内 `/data` 下三个文件整体复制；恢复时停服务、
+  用备份覆盖原文件后重新启动即可；
+- 不要在旧版程序上直接打开高版本数据库（会被拒绝启动）；需要回滚程序时，
+  先恢复升级前的备份。
 
 ## 本地开发（不使用 Docker）
 

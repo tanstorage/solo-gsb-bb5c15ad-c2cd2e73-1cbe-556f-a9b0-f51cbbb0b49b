@@ -1,7 +1,8 @@
-"""FastAPI 入口：启动即建表。"""
+"""FastAPI 入口：启动即按版本迁移建表。"""
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
@@ -34,10 +35,17 @@ from .schemas import (
     UnfreezeResult,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    database.init_db()
+    try:
+        database.init_db()
+    except database.DatabaseVersionTooNew as exc:
+        # 数据库由更新版本的程序写入：拒绝启动，不做任何结构改动。
+        logger.error("refusing to start: %s", exc)
+        raise
     yield
 
 

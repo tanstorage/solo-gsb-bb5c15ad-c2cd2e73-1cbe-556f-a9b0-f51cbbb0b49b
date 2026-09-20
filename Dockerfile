@@ -20,5 +20,5 @@ USER appuser
 VOLUME ["/data"]
 EXPOSE 8000
 
-# 容器启动：init_db 建表由 FastAPI lifespan 完成，依赖已在镜像内装好
+# 容器启动：数据库显式版本迁移（建表/升级）由 FastAPI lifespan 完成，依赖已在镜像内装好
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

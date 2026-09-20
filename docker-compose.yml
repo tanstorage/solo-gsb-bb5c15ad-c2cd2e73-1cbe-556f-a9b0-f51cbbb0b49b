@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # SQLite 数据库文件（容器内路径）；随服务启动自动建表
+      # SQLite 数据库文件（容器内路径）；服务启动时自动执行版本迁移建表/升级
       DATABASE_PATH: /data/mailarchive.db
     volumes:
       - mailarchive-data:/data
