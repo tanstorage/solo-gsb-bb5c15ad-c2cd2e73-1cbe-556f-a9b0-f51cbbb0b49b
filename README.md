@@ -40,7 +40,8 @@ docker compose up --build
 | <http://localhost:8000/health> | 健康检查，返回 `{"status":"ok"}` |
 | <http://localhost:8000/openapi.json> | OpenAPI 描述 |
 
-首次启动会自动在卷内安装环境就绪后的建表全部完成（`app.main` lifespan 中执行幂等 DDL）；
+首次启动会自动在卷内完成建表与版本迁移（`app.main` lifespan 中执行
+幂等迁移，详见下文「持久化」一节）；
 数据库存放在命名卷 `mailarchive-data` 中，容器重建数据不丢。
 
 ## 必要配置
@@ -872,9 +873,34 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 冻结 / 清理下的归并一致性；幂等登记与批次归档、补链、人工纠偏、保留期实际
 清理的全部父指针变更与删除均在**单个事务**内提交。
 
-服务启动的建表 DDL 幂等；早期数据库（`messages` 无 `retain_until` 列、含旧版
-冻结成员快照表 `retention_freeze_members`）会在启动时自动补列、并删除已废弃的
-快照表（冻结锚点保留，保护范围自升级起随当前会话拓扑实时计算），无需手工迁移。
+服务启动时通过 SQLite 的 `PRAGMA user_version` 执行**显式版本迁移**：迁移步骤
+按版本顺序注册（当前最新为版本 3），每一步自身幂等，且**全部待执行迁移在单个
+写事务内完成**、逐级推进版本号——迁移中途失败会整体回滚，不会留下“迁移了一半”
+的数据库：
+
+- **空库**（版本 0 且无任何表）：在该事务内依次执行 v1 至最新版全部迁移，
+  建表后即为最新结构；
+- **旧库**：从其记录的版本起逐级升级，既有数据原样保留。未记录版本的早期库
+  （`messages` 无 `retain_until` 列、含旧版冻结成员快照表
+  `retention_freeze_members`）自动补列、建索引并删除已废弃的快照表
+  （冻结锚点保留，保护范围自升级起随当前会话拓扑实时计算）；
+- **版本过高**：若数据库版本高于当前程序支持的版本，服务**拒绝启动**并输出
+  明确错误（`database schema version … is newer than this program supports …
+  refusing to start`），数据库不被改动；请先升级程序，切勿用旧版打开新版库；
+- 已是最新版时启动不执行任何写操作，重复启动完全无副作用。
+
+版本历史：v1 初始建表与 `messages` 的 `batch_id` / `parent_id` / `sent_at`
+索引；v2 为 `messages` 增加 `retain_until` 列及 `idx_messages_retain` 索引；
+v3 删除废弃的 `retention_freeze_members` 快照表。
+
+> **升级前请备份**：迁移会原地改动数据库文件，建议在升级程序前先复制一份
+> 数据库（Docker 部署可执行
+> `docker run --rm -v mailarchive-data:/data -v "$PWD":/backup alpine \
+> cp /data/mailarchive.db /backup/mailarchive.db.bak`；
+> 本地部署直接 `cp data/mailarchive.db data/mailarchive.db.bak` 即可，
+> 此时最好先停掉服务，避免与 WAL 中的未落盘写入产生不一致）。
+> 回滚程序后如需恢复，停服并用备份文件覆盖原库（连同 `-wal` / `-shm`
+> 附属文件一并删除，让 SQLite 以备份文件为准重新打开）。
 
 ## 本地开发（不使用 Docker）
 
